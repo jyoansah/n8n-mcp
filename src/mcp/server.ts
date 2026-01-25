@@ -14,6 +14,7 @@ import { getWorkflowExampleString } from './workflow-examples';
 import { logger } from '../utils/logger';
 import { NodeRepository } from '../database/node-repository';
 import { DatabaseAdapter, createDatabaseAdapter } from '../database/database-adapter';
+import { getSharedDatabase, releaseSharedDatabase, SharedDatabaseState } from '../database/shared-database';
 import { PropertyFilter } from '../services/property-filter';
 import { TaskTemplates } from '../services/task-templates';
 import { ConfigValidator } from '../services/config-validator';
@@ -62,6 +63,9 @@ interface NodeRow {
   properties_schema?: string;
   operations?: string;
   credentials_required?: string;
+  // AI documentation fields
+  ai_documentation_summary?: string;
+  ai_summary_generated_at?: string;
 }
 
 interface VersionSummary {
@@ -149,6 +153,9 @@ export class N8NDocumentationMCPServer {
   private previousToolTimestamp: number = Date.now();
   private earlyLogger: EarlyErrorLogger | null = null;
   private disabledToolsCache: Set<string> | null = null;
+  private useSharedDatabase: boolean = false;  // Track if using shared DB for cleanup
+  private sharedDbState: SharedDatabaseState | null = null;  // Reference to shared DB state for release
+  private isShutdown: boolean = false;  // Prevent double-shutdown
 
   constructor(instanceContext?: InstanceContext, earlyLogger?: EarlyErrorLogger) {
     this.instanceContext = instanceContext;
@@ -244,18 +251,39 @@ export class N8NDocumentationMCPServer {
    * Order of cleanup:
    * 1. Close MCP server connection
    * 2. Destroy cache (clears entries AND stops cleanup timer)
-   * 3. Close database connection
+   * 3. Release shared database OR close dedicated connection
    * 4. Null out references to help GC
+   *
+   * IMPORTANT: For shared databases, we only release the reference (decrement refCount),
+   * NOT close the database. The database stays open for other sessions.
+   * For in-memory databases (tests), we close the dedicated connection.
    */
   async close(): Promise<void> {
+    // Wait for initialization to complete (or fail) before cleanup
+    // This prevents race conditions where close runs while init is in progress
+    try {
+      await this.initialized;
+    } catch (error) {
+      // Initialization failed - that's OK, we still need to clean up
+      logger.debug('Initialization had failed, proceeding with cleanup', {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+
     try {
       await this.server.close();
 
       // Use destroy() not clear() - also stops the cleanup timer
       this.cache.destroy();
 
-      // Close database connection before nullifying reference
-      if (this.db) {
+      // Handle database cleanup based on whether it's shared or dedicated
+      if (this.useSharedDatabase && this.sharedDbState) {
+        // Shared database: release reference, don't close
+        // The database stays open for other sessions
+        releaseSharedDatabase(this.sharedDbState);
+        logger.debug('Released shared database reference');
+      } else if (this.db) {
+        // Dedicated database (in-memory for tests): close it
         try {
           this.db.close();
         } catch (dbError) {
@@ -270,6 +298,7 @@ export class N8NDocumentationMCPServer {
       this.repository = null;
       this.templateService = null;
       this.earlyLogger = null;
+      this.sharedDbState = null;
     } catch (error) {
       // Log but don't throw - cleanup should be best-effort
       logger.warn('Error closing MCP server', { error: error instanceof Error ? error.message : String(error) });
@@ -285,23 +314,32 @@ export class N8NDocumentationMCPServer {
 
       logger.debug('Database initialization starting...', { dbPath });
 
-      this.db = await createDatabaseAdapter(dbPath);
-      logger.debug('Database adapter created');
-
-      // If using in-memory database for tests, initialize schema
+      // For in-memory databases (tests), create a dedicated connection
+      // For regular databases, use the shared connection to prevent memory leaks
       if (dbPath === ':memory:') {
+        this.db = await createDatabaseAdapter(dbPath);
+        logger.debug('Database adapter created (in-memory mode)');
         await this.initializeInMemorySchema();
         logger.debug('In-memory schema initialized');
+        this.repository = new NodeRepository(this.db);
+        this.templateService = new TemplateService(this.db);
+        // Initialize similarity services for enhanced validation
+        EnhancedConfigValidator.initializeSimilarityServices(this.repository);
+        this.useSharedDatabase = false;
+      } else {
+        // Use shared database connection to prevent ~900MB memory leak per session
+        // See: Memory leak fix - database was being duplicated per session
+        const sharedState = await getSharedDatabase(dbPath);
+        this.db = sharedState.db;
+        this.repository = sharedState.repository;
+        this.templateService = sharedState.templateService;
+        this.sharedDbState = sharedState;
+        this.useSharedDatabase = true;
+        logger.debug('Using shared database connection');
       }
 
-      this.repository = new NodeRepository(this.db);
       logger.debug('Node repository initialized');
-
-      this.templateService = new TemplateService(this.db);
       logger.debug('Template service initialized');
-
-      // Initialize similarity services for enhanced validation
-      EnhancedConfigValidator.initializeSimilarityServices(this.repository);
       logger.debug('Similarity services initialized');
 
       // Checkpoint: Database connected (v2.18.3)
@@ -1118,7 +1156,11 @@ export class N8NDocumentationMCPServer {
         this.validateToolParams(name, args, ['query']);
         // Convert limit to number if provided, otherwise use default
         const limit = args.limit !== undefined ? Number(args.limit) || 20 : 20;
-        return this.searchNodes(args.query, limit, { mode: args.mode, includeExamples: args.includeExamples });
+        return this.searchNodes(args.query, limit, {
+          mode: args.mode,
+          includeExamples: args.includeExamples,
+          source: args.source
+        });
       case 'get_node':
         this.validateToolParams(name, args, ['nodeType']);
         // Handle consolidated modes: docs, search_properties
@@ -1471,6 +1513,7 @@ export class N8NDocumentationMCPServer {
       mode?: 'OR' | 'AND' | 'FUZZY';
       includeSource?: boolean;
       includeExamples?: boolean;
+      source?: 'all' | 'core' | 'community' | 'verified';
     }
   ): Promise<any> {
     await this.ensureInitialized();
@@ -1509,7 +1552,11 @@ export class N8NDocumentationMCPServer {
     query: string,
     limit: number,
     mode: 'OR' | 'AND' | 'FUZZY',
-    options?: { includeSource?: boolean; includeExamples?: boolean; }
+    options?: {
+      includeSource?: boolean;
+      includeExamples?: boolean;
+      source?: 'all' | 'core' | 'community' | 'verified';
+    }
   ): Promise<any> {
     if (!this.db) throw new Error('Database not initialized');
 
@@ -1549,6 +1596,22 @@ export class N8NDocumentationMCPServer {
     }
     
     try {
+      // Build source filter SQL
+      let sourceFilter = '';
+      const sourceValue = options?.source || 'all';
+      switch (sourceValue) {
+        case 'core':
+          sourceFilter = 'AND n.is_community = 0';
+          break;
+        case 'community':
+          sourceFilter = 'AND n.is_community = 1';
+          break;
+        case 'verified':
+          sourceFilter = 'AND n.is_community = 1 AND n.is_verified = 1';
+          break;
+        // 'all' - no filter
+      }
+
       // Use FTS5 with ranking
       const nodes = this.db.prepare(`
         SELECT
@@ -1557,6 +1620,7 @@ export class N8NDocumentationMCPServer {
         FROM nodes n
         JOIN nodes_fts ON n.rowid = nodes_fts.rowid
         WHERE nodes_fts MATCH ?
+        ${sourceFilter}
         ORDER BY
           CASE
             WHEN LOWER(n.display_name) = LOWER(?) THEN 0
@@ -1600,15 +1664,31 @@ export class N8NDocumentationMCPServer {
       
       const result: any = {
         query,
-        results: scoredNodes.map(node => ({
-          nodeType: node.node_type,
-          workflowNodeType: getWorkflowNodeType(node.package_name, node.node_type),
-          displayName: node.display_name,
-          description: node.description,
-          category: node.category,
-          package: node.package_name,
-          relevance: this.calculateRelevance(node, cleanedQuery)
-        })),
+        results: scoredNodes.map(node => {
+          const nodeResult: any = {
+            nodeType: node.node_type,
+            workflowNodeType: getWorkflowNodeType(node.package_name, node.node_type),
+            displayName: node.display_name,
+            description: node.description,
+            category: node.category,
+            package: node.package_name,
+            relevance: this.calculateRelevance(node, cleanedQuery)
+          };
+
+          // Add community metadata if this is a community node
+          if ((node as any).is_community === 1) {
+            nodeResult.isCommunity = true;
+            nodeResult.isVerified = (node as any).is_verified === 1;
+            if ((node as any).author_name) {
+              nodeResult.authorName = (node as any).author_name;
+            }
+            if ((node as any).npm_downloads) {
+              nodeResult.npmDownloads = (node as any).npm_downloads;
+            }
+          }
+
+          return nodeResult;
+        }),
         totalCount: scoredNodes.length
       };
 
@@ -1824,9 +1904,29 @@ export class N8NDocumentationMCPServer {
   private async searchNodesLIKE(
     query: string,
     limit: number,
-    options?: { includeSource?: boolean; includeExamples?: boolean; }
+    options?: {
+      includeSource?: boolean;
+      includeExamples?: boolean;
+      source?: 'all' | 'core' | 'community' | 'verified';
+    }
   ): Promise<any> {
     if (!this.db) throw new Error('Database not initialized');
+
+    // Build source filter SQL
+    let sourceFilter = '';
+    const sourceValue = options?.source || 'all';
+    switch (sourceValue) {
+      case 'core':
+        sourceFilter = 'AND is_community = 0';
+        break;
+      case 'community':
+        sourceFilter = 'AND is_community = 1';
+        break;
+      case 'verified':
+        sourceFilter = 'AND is_community = 1 AND is_verified = 1';
+        break;
+      // 'all' - no filter
+    }
 
     // This is the existing LIKE-based implementation
     // Handle exact phrase searches with quotes
@@ -1834,7 +1934,8 @@ export class N8NDocumentationMCPServer {
       const exactPhrase = query.slice(1, -1);
       const nodes = this.db!.prepare(`
         SELECT * FROM nodes
-        WHERE node_type LIKE ? OR display_name LIKE ? OR description LIKE ?
+        WHERE (node_type LIKE ? OR display_name LIKE ? OR description LIKE ?)
+        ${sourceFilter}
         LIMIT ?
       `).all(`%${exactPhrase}%`, `%${exactPhrase}%`, `%${exactPhrase}%`, limit * 3) as NodeRow[];
 
@@ -1843,14 +1944,30 @@ export class N8NDocumentationMCPServer {
 
       const result: any = {
         query,
-        results: rankedNodes.map(node => ({
-          nodeType: node.node_type,
-          workflowNodeType: getWorkflowNodeType(node.package_name, node.node_type),
-          displayName: node.display_name,
-          description: node.description,
-          category: node.category,
-          package: node.package_name
-        })),
+        results: rankedNodes.map(node => {
+          const nodeResult: any = {
+            nodeType: node.node_type,
+            workflowNodeType: getWorkflowNodeType(node.package_name, node.node_type),
+            displayName: node.display_name,
+            description: node.description,
+            category: node.category,
+            package: node.package_name
+          };
+
+          // Add community metadata if this is a community node
+          if ((node as any).is_community === 1) {
+            nodeResult.isCommunity = true;
+            nodeResult.isVerified = (node as any).is_verified === 1;
+            if ((node as any).author_name) {
+              nodeResult.authorName = (node as any).author_name;
+            }
+            if ((node as any).npm_downloads) {
+              nodeResult.npmDownloads = (node as any).npm_downloads;
+            }
+          }
+
+          return nodeResult;
+        }),
         totalCount: rankedNodes.length
       };
 
@@ -1902,8 +2019,9 @@ export class N8NDocumentationMCPServer {
     params.push(limit * 3);
     
     const nodes = this.db!.prepare(`
-      SELECT DISTINCT * FROM nodes 
-      WHERE ${conditions}
+      SELECT DISTINCT * FROM nodes
+      WHERE (${conditions})
+      ${sourceFilter}
       LIMIT ?
     `).all(...params) as NodeRow[];
     
@@ -1912,14 +2030,30 @@ export class N8NDocumentationMCPServer {
 
     const result: any = {
       query,
-      results: rankedNodes.map(node => ({
-        nodeType: node.node_type,
-        workflowNodeType: getWorkflowNodeType(node.package_name, node.node_type),
-        displayName: node.display_name,
-        description: node.description,
-        category: node.category,
-        package: node.package_name
-      })),
+      results: rankedNodes.map(node => {
+        const nodeResult: any = {
+          nodeType: node.node_type,
+          workflowNodeType: getWorkflowNodeType(node.package_name, node.node_type),
+          displayName: node.display_name,
+          description: node.description,
+          category: node.category,
+          package: node.package_name
+        };
+
+        // Add community metadata if this is a community node
+        if ((node as any).is_community === 1) {
+          nodeResult.isCommunity = true;
+          nodeResult.isVerified = (node as any).is_verified === 1;
+          if ((node as any).author_name) {
+            nodeResult.authorName = (node as any).author_name;
+          }
+          if ((node as any).npm_downloads) {
+            nodeResult.npmDownloads = (node as any).npm_downloads;
+          }
+        }
+
+        return nodeResult;
+      }),
       totalCount: rankedNodes.length
     };
 
@@ -2144,31 +2278,34 @@ export class N8NDocumentationMCPServer {
     // First try with normalized type
     const normalizedType = NodeTypeNormalizer.normalizeToFullForm(nodeType);
     let node = this.db!.prepare(`
-      SELECT node_type, display_name, documentation, description 
-      FROM nodes 
+      SELECT node_type, display_name, documentation, description,
+             ai_documentation_summary, ai_summary_generated_at
+      FROM nodes
       WHERE node_type = ?
     `).get(normalizedType) as NodeRow | undefined;
-    
+
     // If not found and normalization changed the type, try original
     if (!node && normalizedType !== nodeType) {
       node = this.db!.prepare(`
-        SELECT node_type, display_name, documentation, description 
-        FROM nodes 
+        SELECT node_type, display_name, documentation, description,
+               ai_documentation_summary, ai_summary_generated_at
+        FROM nodes
         WHERE node_type = ?
       `).get(nodeType) as NodeRow | undefined;
     }
-    
+
     // If still not found, try alternatives
     if (!node) {
       const alternatives = getNodeTypeAlternatives(normalizedType);
-      
+
       for (const alt of alternatives) {
         node = this.db!.prepare(`
-          SELECT node_type, display_name, documentation, description 
-          FROM nodes 
+          SELECT node_type, display_name, documentation, description,
+                 ai_documentation_summary, ai_summary_generated_at
+          FROM nodes
           WHERE node_type = ?
         `).get(alt) as NodeRow | undefined;
-        
+
         if (node) break;
       }
     }
@@ -2177,6 +2314,11 @@ export class N8NDocumentationMCPServer {
       throw new Error(`Node ${nodeType} not found`);
     }
     
+    // Parse AI documentation summary if present
+    const aiDocSummary = node.ai_documentation_summary
+      ? this.safeJsonParse(node.ai_documentation_summary, null)
+      : null;
+
     // If no documentation, generate fallback with null safety
     if (!node.documentation) {
       const essentials = await this.getNodeEssentials(nodeType);
@@ -2200,7 +2342,9 @@ ${essentials?.commonProperties?.length > 0 ?
 ## Note
 Full documentation is being prepared. For now, use get_node_essentials for configuration help.
 `,
-        hasDocumentation: false
+        hasDocumentation: false,
+        aiDocumentationSummary: aiDocSummary,
+        aiSummaryGeneratedAt: node.ai_summary_generated_at || null,
       };
     }
 
@@ -2209,7 +2353,17 @@ Full documentation is being prepared. For now, use get_node_essentials for confi
       displayName: node.display_name || 'Unknown Node',
       documentation: node.documentation,
       hasDocumentation: true,
+      aiDocumentationSummary: aiDocSummary,
+      aiSummaryGeneratedAt: node.ai_summary_generated_at || null,
     };
+  }
+
+  private safeJsonParse(json: string, defaultValue: any = null): any {
+    try {
+      return JSON.parse(json);
+    } catch {
+      return defaultValue;
+    }
   }
 
   private async getDatabaseStatistics(): Promise<any> {
@@ -3840,8 +3994,33 @@ Full documentation is being prepared. For now, use get_node_essentials for confi
   }
   
   async shutdown(): Promise<void> {
+    // Prevent double-shutdown
+    if (this.isShutdown) {
+      logger.debug('Shutdown already called, skipping');
+      return;
+    }
+    this.isShutdown = true;
+
     logger.info('Shutting down MCP server...');
-    
+
+    // Wait for initialization to complete (or fail) before cleanup
+    // This prevents race conditions where shutdown runs while init is in progress
+    try {
+      await this.initialized;
+    } catch (error) {
+      // Initialization failed - that's OK, we still need to clean up
+      logger.debug('Initialization had failed, proceeding with cleanup', {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+
+    // Close MCP server connection (for consistency with close() method)
+    try {
+      await this.server.close();
+    } catch (error) {
+      logger.error('Error closing MCP server:', error);
+    }
+
     // Clean up cache timers to prevent memory leaks
     if (this.cache) {
       try {
@@ -3851,15 +4030,31 @@ Full documentation is being prepared. For now, use get_node_essentials for confi
         logger.error('Error cleaning up cache:', error);
       }
     }
-    
-    // Close database connection if it exists
-    if (this.db) {
+
+    // Handle database cleanup based on whether it's shared or dedicated
+    // For shared databases, we only release the reference (decrement refCount)
+    // For dedicated databases (in-memory for tests), we close the connection
+    if (this.useSharedDatabase && this.sharedDbState) {
       try {
-        await this.db.close();
+        releaseSharedDatabase(this.sharedDbState);
+        logger.info('Released shared database reference');
+      } catch (error) {
+        logger.error('Error releasing shared database:', error);
+      }
+    } else if (this.db) {
+      try {
+        this.db.close();
         logger.info('Database connection closed');
       } catch (error) {
         logger.error('Error closing database:', error);
       }
     }
+
+    // Null out references to help garbage collection
+    this.db = null;
+    this.repository = null;
+    this.templateService = null;
+    this.earlyLogger = null;
+    this.sharedDbState = null;
   }
 }

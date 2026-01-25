@@ -776,7 +776,11 @@ class N8NDocumentationMCPServer {
             case 'search_nodes':
                 this.validateToolParams(name, args, ['query']);
                 const limit = args.limit !== undefined ? Number(args.limit) || 20 : 20;
-                return this.searchNodes(args.query, limit, { mode: args.mode, includeExamples: args.includeExamples });
+                return this.searchNodes(args.query, limit, {
+                    mode: args.mode,
+                    includeExamples: args.includeExamples,
+                    source: args.source
+                });
             case 'get_node':
                 this.validateToolParams(name, args, ['nodeType']);
                 if (args.mode === 'docs') {
@@ -1117,6 +1121,19 @@ class N8NDocumentationMCPServer {
             }
         }
         try {
+            let sourceFilter = '';
+            const sourceValue = options?.source || 'all';
+            switch (sourceValue) {
+                case 'core':
+                    sourceFilter = 'AND n.is_community = 0';
+                    break;
+                case 'community':
+                    sourceFilter = 'AND n.is_community = 1';
+                    break;
+                case 'verified':
+                    sourceFilter = 'AND n.is_community = 1 AND n.is_verified = 1';
+                    break;
+            }
             const nodes = this.db.prepare(`
         SELECT
           n.*,
@@ -1124,6 +1141,7 @@ class N8NDocumentationMCPServer {
         FROM nodes n
         JOIN nodes_fts ON n.rowid = nodes_fts.rowid
         WHERE nodes_fts MATCH ?
+        ${sourceFilter}
         ORDER BY
           CASE
             WHEN LOWER(n.display_name) = LOWER(?) THEN 0
@@ -1156,15 +1174,28 @@ class N8NDocumentationMCPServer {
             }
             const result = {
                 query,
-                results: scoredNodes.map(node => ({
-                    nodeType: node.node_type,
-                    workflowNodeType: (0, node_utils_1.getWorkflowNodeType)(node.package_name, node.node_type),
-                    displayName: node.display_name,
-                    description: node.description,
-                    category: node.category,
-                    package: node.package_name,
-                    relevance: this.calculateRelevance(node, cleanedQuery)
-                })),
+                results: scoredNodes.map(node => {
+                    const nodeResult = {
+                        nodeType: node.node_type,
+                        workflowNodeType: (0, node_utils_1.getWorkflowNodeType)(node.package_name, node.node_type),
+                        displayName: node.display_name,
+                        description: node.description,
+                        category: node.category,
+                        package: node.package_name,
+                        relevance: this.calculateRelevance(node, cleanedQuery)
+                    };
+                    if (node.is_community === 1) {
+                        nodeResult.isCommunity = true;
+                        nodeResult.isVerified = node.is_verified === 1;
+                        if (node.author_name) {
+                            nodeResult.authorName = node.author_name;
+                        }
+                        if (node.npm_downloads) {
+                            nodeResult.npmDownloads = node.npm_downloads;
+                        }
+                    }
+                    return nodeResult;
+                }),
                 totalCount: scoredNodes.length
             };
             if (mode !== 'OR') {
@@ -1326,24 +1357,51 @@ class N8NDocumentationMCPServer {
     async searchNodesLIKE(query, limit, options) {
         if (!this.db)
             throw new Error('Database not initialized');
+        let sourceFilter = '';
+        const sourceValue = options?.source || 'all';
+        switch (sourceValue) {
+            case 'core':
+                sourceFilter = 'AND is_community = 0';
+                break;
+            case 'community':
+                sourceFilter = 'AND is_community = 1';
+                break;
+            case 'verified':
+                sourceFilter = 'AND is_community = 1 AND is_verified = 1';
+                break;
+        }
         if (query.startsWith('"') && query.endsWith('"')) {
             const exactPhrase = query.slice(1, -1);
             const nodes = this.db.prepare(`
         SELECT * FROM nodes
-        WHERE node_type LIKE ? OR display_name LIKE ? OR description LIKE ?
+        WHERE (node_type LIKE ? OR display_name LIKE ? OR description LIKE ?)
+        ${sourceFilter}
         LIMIT ?
       `).all(`%${exactPhrase}%`, `%${exactPhrase}%`, `%${exactPhrase}%`, limit * 3);
             const rankedNodes = this.rankSearchResults(nodes, exactPhrase, limit);
             const result = {
                 query,
-                results: rankedNodes.map(node => ({
-                    nodeType: node.node_type,
-                    workflowNodeType: (0, node_utils_1.getWorkflowNodeType)(node.package_name, node.node_type),
-                    displayName: node.display_name,
-                    description: node.description,
-                    category: node.category,
-                    package: node.package_name
-                })),
+                results: rankedNodes.map(node => {
+                    const nodeResult = {
+                        nodeType: node.node_type,
+                        workflowNodeType: (0, node_utils_1.getWorkflowNodeType)(node.package_name, node.node_type),
+                        displayName: node.display_name,
+                        description: node.description,
+                        category: node.category,
+                        package: node.package_name
+                    };
+                    if (node.is_community === 1) {
+                        nodeResult.isCommunity = true;
+                        nodeResult.isVerified = node.is_verified === 1;
+                        if (node.author_name) {
+                            nodeResult.authorName = node.author_name;
+                        }
+                        if (node.npm_downloads) {
+                            nodeResult.npmDownloads = node.npm_downloads;
+                        }
+                    }
+                    return nodeResult;
+                }),
                 totalCount: rankedNodes.length
             };
             if (options?.includeExamples) {
@@ -1382,21 +1440,35 @@ class N8NDocumentationMCPServer {
         const params = words.flatMap(w => [`%${w}%`, `%${w}%`, `%${w}%`]);
         params.push(limit * 3);
         const nodes = this.db.prepare(`
-      SELECT DISTINCT * FROM nodes 
-      WHERE ${conditions}
+      SELECT DISTINCT * FROM nodes
+      WHERE (${conditions})
+      ${sourceFilter}
       LIMIT ?
     `).all(...params);
         const rankedNodes = this.rankSearchResults(nodes, query, limit);
         const result = {
             query,
-            results: rankedNodes.map(node => ({
-                nodeType: node.node_type,
-                workflowNodeType: (0, node_utils_1.getWorkflowNodeType)(node.package_name, node.node_type),
-                displayName: node.display_name,
-                description: node.description,
-                category: node.category,
-                package: node.package_name
-            })),
+            results: rankedNodes.map(node => {
+                const nodeResult = {
+                    nodeType: node.node_type,
+                    workflowNodeType: (0, node_utils_1.getWorkflowNodeType)(node.package_name, node.node_type),
+                    displayName: node.display_name,
+                    description: node.description,
+                    category: node.category,
+                    package: node.package_name
+                };
+                if (node.is_community === 1) {
+                    nodeResult.isCommunity = true;
+                    nodeResult.isVerified = node.is_verified === 1;
+                    if (node.author_name) {
+                        nodeResult.authorName = node.author_name;
+                    }
+                    if (node.npm_downloads) {
+                        nodeResult.npmDownloads = node.npm_downloads;
+                    }
+                }
+                return nodeResult;
+            }),
             totalCount: rankedNodes.length
         };
         if (options?.includeExamples) {
@@ -1573,14 +1645,16 @@ class N8NDocumentationMCPServer {
             throw new Error('Database not initialized');
         const normalizedType = node_type_normalizer_1.NodeTypeNormalizer.normalizeToFullForm(nodeType);
         let node = this.db.prepare(`
-      SELECT node_type, display_name, documentation, description 
-      FROM nodes 
+      SELECT node_type, display_name, documentation, description,
+             ai_documentation_summary, ai_summary_generated_at
+      FROM nodes
       WHERE node_type = ?
     `).get(normalizedType);
         if (!node && normalizedType !== nodeType) {
             node = this.db.prepare(`
-        SELECT node_type, display_name, documentation, description 
-        FROM nodes 
+        SELECT node_type, display_name, documentation, description,
+               ai_documentation_summary, ai_summary_generated_at
+        FROM nodes
         WHERE node_type = ?
       `).get(nodeType);
         }
@@ -1588,8 +1662,9 @@ class N8NDocumentationMCPServer {
             const alternatives = (0, node_utils_1.getNodeTypeAlternatives)(normalizedType);
             for (const alt of alternatives) {
                 node = this.db.prepare(`
-          SELECT node_type, display_name, documentation, description 
-          FROM nodes 
+          SELECT node_type, display_name, documentation, description,
+                 ai_documentation_summary, ai_summary_generated_at
+          FROM nodes
           WHERE node_type = ?
         `).get(alt);
                 if (node)
@@ -1599,6 +1674,9 @@ class N8NDocumentationMCPServer {
         if (!node) {
             throw new Error(`Node ${nodeType} not found`);
         }
+        const aiDocSummary = node.ai_documentation_summary
+            ? this.safeJsonParse(node.ai_documentation_summary, null)
+            : null;
         if (!node.documentation) {
             const essentials = await this.getNodeEssentials(nodeType);
             return {
@@ -1618,7 +1696,9 @@ ${essentials?.commonProperties?.length > 0 ?
 ## Note
 Full documentation is being prepared. For now, use get_node_essentials for configuration help.
 `,
-                hasDocumentation: false
+                hasDocumentation: false,
+                aiDocumentationSummary: aiDocSummary,
+                aiSummaryGeneratedAt: node.ai_summary_generated_at || null,
             };
         }
         return {
@@ -1626,7 +1706,17 @@ Full documentation is being prepared. For now, use get_node_essentials for confi
             displayName: node.display_name || 'Unknown Node',
             documentation: node.documentation,
             hasDocumentation: true,
+            aiDocumentationSummary: aiDocSummary,
+            aiSummaryGeneratedAt: node.ai_summary_generated_at || null,
         };
+    }
+    safeJsonParse(json, defaultValue = null) {
+        try {
+            return JSON.parse(json);
+        }
+        catch {
+            return defaultValue;
+        }
     }
     async getDatabaseStatistics() {
         await this.ensureInitialized();
